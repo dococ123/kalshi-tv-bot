@@ -15,16 +15,17 @@ KALSHI_API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 KEY_ID = os.environ.get("KALSHI_API_KEY_ID") or os.environ.get("KALSHI_KEY_ID")
 PRIVATE_KEY_STR = os.environ.get("KALSHI_PRIVATE_KEY")
 PASSPHRASE = os.environ.get("WEBHOOK_PASSPHRASE", "my_secret_key_123")
+MAX_MULTIPLIER = 8  # Risk Cap: Prevents Martingale from exceeding 8 contracts ($8)
 
 # ---------------------------------------------------------
-# STATE MACHINE (Streak Rider & Martingale on Paper Win)
+# BOT INTERNAL STATE
 # ---------------------------------------------------------
 state = {
     "mode": "LIVE",        # "LIVE" or "PAPER"
-    "multiplier": 1,       # Martingale level: 1, 2, 4, 8...
-    "last_ticker": None,   # Last Kalshi market
-    "last_side": None,     # "yes" or "no"
-    "last_was_live": True  # True if placed with real money, False if paper
+    "multiplier": 1,       # 1, 2, 4, max 8
+    "last_ticker": None,   
+    "last_side": None,     
+    "last_was_live": True  
 }
 
 def get_private_key():
@@ -53,10 +54,23 @@ def kalshi_request(method: str, path: str, body: dict = None):
     url = f"{KALSHI_API_BASE}{path}"
     if method.upper() == "GET":
         return requests.get(url, headers=headers)
+    elif method.upper() == "DELETE":
+        return requests.delete(url, headers=headers)
     return requests.post(url, headers=headers, json=body)
 
+def cancel_stale_orders():
+    """Cancels any unfilled resting limit orders from prior cycles."""
+    res = kalshi_request("GET", "/portfolio/orders?status=resting")
+    if res.status_code == 200:
+        orders = res.json().get("orders", [])
+        for order in orders:
+            order_id = order.get("order_id")
+            if order_id:
+                kalshi_request("DELETE", f"/portfolio/orders/{order_id}")
+                print(f"[CLEANUP] Canceled resting order: {order_id}")
+
 def evaluate_previous_trade():
-    """Checks settlement of the previous market to evaluate win/loss."""
+    """Audits previous market settlement to route state between LIVE and PAPER."""
     if not state["last_ticker"]:
         return
 
@@ -64,67 +78,67 @@ def evaluate_previous_trade():
     res = kalshi_request("GET", path)
     if res.status_code == 200:
         market = res.json().get("market", {})
-        result = market.get("result") # "yes", "no", or None if open
+        result = market.get("result")
         if result:
             won = (result == state["last_side"])
-            print(f"[SETTLEMENT] Market: {state['last_ticker']} | Result: {result} | Bot Side: {state['last_side']} | Won: {won}")
+            print(f"[SETTLEMENT] {state['last_ticker']} result: {result} | Choice: {state['last_side']} | Won: {won}")
             
             if state["last_was_live"]:
                 if won:
-                    print("[RESULT] Live WIN. Keeping live streak active at base size.")
+                    print("[RESULT] Live WIN. Continuing streak at 1x base size.")
                     state["mode"] = "LIVE"
                     state["multiplier"] = 1
                 else:
-                    print("[RESULT] Live LOSS. Switching to PAPER mode to avoid streak losses.")
+                    print("[RESULT] Live LOSS. Switching to PAPER mode to absorb losing streaks.")
                     state["mode"] = "PAPER"
             else:
                 if won:
-                    print("[RESULT] Paper WIN achieved. Resuming LIVE mode with doubled size.")
+                    new_mult = min(state["multiplier"] * 2, MAX_MULTIPLIER)
+                    print(f"[RESULT] Paper WIN achieved. Returning to LIVE mode at {new_mult}x size.")
                     state["mode"] = "LIVE"
-                    state["multiplier"] *= 2
+                    state["multiplier"] = new_mult
                 else:
-                    print("[RESULT] Paper LOSS. Remaining in PAPER mode until next paper win.")
+                    print("[RESULT] Paper LOSS. Staying in PAPER mode.")
                     state["mode"] = "PAPER"
 
 @app.post("/webhook")
 async def webhook(request: Request):
     payload = await request.json()
     
-    # 1. Verify passphrase
     if payload.get("passphrase") != PASSPHRASE:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     side = payload.get("side", "yes").lower()
 
-    # 2. Check previous settlement to maintain streak state
+    # 1. Cancel previous unfilled limit orders so they do not stack
+    cancel_stale_orders()
+
+    # 2. Check settlement on previous market
     evaluate_previous_trade()
 
-    # 3. Locate active 15m BTC contract
+    # 3. Fetch active 15m contract
     path = "/markets?series_ticker=KXBTC15M&status=open"
     m_res = kalshi_request("GET", path)
     if m_res.status_code != 200:
-        raise HTTPException(status_code=500, detail="Failed to fetch Kalshi markets")
+        raise HTTPException(status_code=500, detail="Failed to fetch active Kalshi markets")
 
     markets = m_res.json().get("markets", [])
     if not markets:
-        return {"status": "skipped", "reason": "No open 15m markets available"}
+        return {"status": "skipped", "reason": "No open 15m market"}
 
     target_market = markets[0]
     ticker = target_market["ticker"]
 
-    # 4. Handle Paper Mode (Virtual Tracking)
+    # 4. Virtual Paper Tracking
     if state["mode"] == "PAPER":
-        print(f"[PAPER TRADE] Virtual order recorded for {ticker} | Side: {side.upper()} (Targeting 1:1 <= 50¢)")
+        print(f"[PAPER TRADE] Virtual order tracking for {ticker} | Side: {side.upper()} @ 50¢ limit")
         state["last_ticker"] = ticker
         state["last_side"] = side
         state["last_was_live"] = False
         return {"status": "paper_recorded", "ticker": ticker, "mode": "PAPER"}
 
-    # 5. Execute LIVE Order with a 50¢ Rest Limit Order
-    # Setting limit price to 50¢ ensures fill ONLY occurs if price is 1:1 or better (<= 50¢).
-    # If market is > 50¢, the order rests on Kalshi's book waiting for the dip.
+    # 5. Live Limit Order Execution at 1:1 (50¢ limit price)
     contracts = 1 * state["multiplier"]
-    
     order_body = {
         "action": "buy",
         "count": contracts,
