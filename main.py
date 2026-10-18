@@ -109,10 +109,32 @@ def check_previous_settlement():
 
 
 def get_current_btc_market():
+    # 1. Fetch open 15m Bitcoin events with nested active markets
+    resp = kalshi_request("GET", "/events", {
+        "series_ticker": "KXBTC15M",
+        "status": "open",
+        "with_nested_markets": True
+    })
+    
+    if resp.status_code == 200:
+        events = resp.json().get("events", [])
+        if events:
+            # Sort events by close time to ensure we trade the currently closing 15m window
+            events_sorted = sorted(
+                events, 
+                key=lambda e: min([m.get("close_time", "") for m in e.get("markets", [])] or [e.get("mutually_exclusive", "")])
+            )
+            for ev in events_sorted:
+                markets = ev.get("markets", [])
+                for m in markets:
+                    if m.get("status") in ["active", "open"] or not m.get("status"):
+                        return m.get("ticker")
+
+    # 2. Fallback to direct /markets query
     resp = kalshi_request("GET", "/markets", {
         "series_ticker": "KXBTC15M",
         "status": "open",
-        "limit": 5
+        "limit": 10
     })
     if resp.status_code != 200:
         raise Exception(f"Failed to fetch KXBTC15M markets: {resp.text}")
