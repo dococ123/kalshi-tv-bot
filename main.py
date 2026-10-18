@@ -23,135 +23,168 @@ MAX_MULTIPLIER = 8  # Risk Cap: Prevents Martingale from exceeding 8 contracts (
 state = {
     "mode": "LIVE",        # "LIVE" or "PAPER"
     "multiplier": 1,       # 1, 2, 4, max 8
-    "last_ticker": None,   
-    "last_side": None,     
-    "last_was_live": True  
+    "last_ticker": None,
+    "last_side": None,
+    "last_was_live": True
 }
+
 
 def get_private_key():
     if not PRIVATE_KEY_STR:
         raise ValueError("Missing KALSHI_PRIVATE_KEY environment variable")
     return serialization.load_pem_private_key(PRIVATE_KEY_STR.encode("utf-8"), password=None)
 
-def sign_pss(text: str) -> str:
-    key = get_private_key()
-    sig = key.sign(
-        text.encode("utf-8"),
-        padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
-        hashes.SHA256(),
-    )
-    return base64.b64encode(sig).decode("utf-8")
 
-def kalshi_request(method: str, path: str, body: dict = None):
-    ts = str(int(time.time() * 1000))
-    sig = sign_pss(ts + method.upper() + path)
+def sign_pss(text: str) -> str:
+    private_key = get_private_key()
+    signature = private_key.sign(
+        text.encode("utf-8"),
+        padding.PSS(
+            mgf=padding.MGF1(hashes.SHA256()),
+            salt_length=padding.PSS.DIGEST_LENGTH
+        ),
+        hashes.SHA256()
+    )
+    return base64.b64encode(signature).decode("utf-8")
+
+
+def kalshi_request(method: str, path: str, payload: dict = None):
+    timestamp_ms = str(int(time.time() * 1000))
+    msg_to_sign = timestamp_ms + method.upper() + "/trade-api/v2" + path
+    sig = sign_pss(msg_to_sign)
+
     headers = {
+        "Content-Type": "application/json",
         "KALSHI-ACCESS-KEY": KEY_ID,
         "KALSHI-ACCESS-SIGNATURE": sig,
-        "KALSHI-ACCESS-TIMESTAMP": ts,
-        "Content-Type": "application/json",
+        "KALSHI-ACCESS-TIMESTAMP": timestamp_ms
     }
-    url = f"{KALSHI_API_BASE}{path}"
+
+    url = KALSHI_API_BASE + path
     if method.upper() == "GET":
-        return requests.get(url, headers=headers)
+        resp = requests.get(url, headers=headers, params=payload)
+    elif method.upper() == "POST":
+        resp = requests.post(url, headers=headers, json=payload)
     elif method.upper() == "DELETE":
-        return requests.delete(url, headers=headers)
-    return requests.post(url, headers=headers, json=body)
+        resp = requests.delete(url, headers=headers)
+    else:
+        raise ValueError(f"Unsupported method: {method}")
 
-def cancel_stale_orders():
-    """Cancels any unfilled resting limit orders from prior cycles."""
-    res = kalshi_request("GET", "/portfolio/orders?status=resting")
-    if res.status_code == 200:
-        orders = res.json().get("orders", [])
-        for order in orders:
-            order_id = order.get("order_id")
-            if order_id:
-                kalshi_request("DELETE", f"/portfolio/orders/{order_id}")
-                print(f"[CLEANUP] Canceled resting order: {order_id}")
+    return resp
 
-def evaluate_previous_trade():
-    """Audits previous market settlement to route state between LIVE and PAPER."""
+
+def cancel_resting_orders():
+    try:
+        resp = kalshi_request("GET", "/portfolio/orders", {"status": "resting"})
+        if resp.status_code == 200:
+            orders = resp.json().get("orders", [])
+            for o in orders:
+                oid = o.get("order_id")
+                kalshi_request("DELETE", f"/portfolio/orders/{oid}")
+                print(f"[CLEANUP] Canceled resting order: {oid}")
+    except Exception as e:
+        print(f"[CLEANUP ERROR] {e}")
+
+
+def check_previous_settlement():
+    global state
     if not state["last_ticker"]:
         return
 
-    path = f"/markets/{state['last_ticker']}"
-    res = kalshi_request("GET", path)
-    if res.status_code == 200:
-        market = res.json().get("market", {})
-        result = market.get("result")
-        if result:
-            won = (result == state["last_side"])
-            print(f"[SETTLEMENT] {state['last_ticker']} result: {result} | Choice: {state['last_side']} | Won: {won}")
-            
-            if state["last_was_live"]:
-                if won:
-                    print("[RESULT] Live WIN. Continuing streak at 1x base size.")
-                    state["mode"] = "LIVE"
+    try:
+        resp = kalshi_request("GET", f"/markets/{state['last_ticker']}")
+        if resp.status_code == 200:
+            m = resp.json().get("market", {})
+            result = m.get("result")  # "yes" or "no"
+
+            if result:
+                if result == state["last_side"]:
+                    print(f"[SETTLEMENT] WIN on {state['last_ticker']}! Resetting multiplier to 1.")
                     state["multiplier"] = 1
                 else:
-                    print("[RESULT] Live LOSS. Switching to PAPER mode to absorb losing streaks.")
-                    state["mode"] = "PAPER"
-            else:
-                if won:
                     new_mult = min(state["multiplier"] * 2, MAX_MULTIPLIER)
-                    print(f"[RESULT] Paper WIN achieved. Returning to LIVE mode at {new_mult}x size.")
-                    state["mode"] = "LIVE"
+                    print(f"[SETTLEMENT] LOSS on {state['last_ticker']}. Multiplier increased to {new_mult}.")
                     state["multiplier"] = new_mult
-                else:
-                    print("[RESULT] Paper LOSS. Staying in PAPER mode.")
-                    state["mode"] = "PAPER"
+                state["last_ticker"] = None
+                state["last_side"] = None
+    except Exception as e:
+        print(f"[SETTLEMENT CHECK ERROR] {e}")
+
+
+def get_current_btc_market():
+    resp = kalshi_request("GET", "/markets", {
+        "series_ticker": "KXBTC15M",
+        "status": "open",
+        "limit": 5
+    })
+    if resp.status_code != 200:
+        raise Exception(f"Failed to fetch KXBTC15M markets: {resp.text}")
+
+    markets = resp.json().get("markets", [])
+    if not markets:
+        raise Exception("No active open KXBTC15M market found")
+
+    markets_sorted = sorted(markets, key=lambda x: x.get("close_time", ""))
+    return markets_sorted[0].get("ticker")
+
+
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "kalshi-tradingview-bot", "state": state}
+
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    payload = await request.json()
-    
-    if payload.get("passphrase") != PASSPHRASE:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    global state
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
 
-    side = payload.get("side", "yes").lower()
+    if data.get("passphrase") != PASSPHRASE:
+        raise HTTPException(status_code=401, detail="Unauthorized passphrase")
 
-    # 1. Cancel previous unfilled limit orders so they do not stack
-    cancel_stale_orders()
+    side = data.get("side", "").lower()
+    if side not in ["yes", "no"]:
+        raise HTTPException(status_code=400, detail="Side must be 'yes' or 'no'")
 
-    # 2. Check settlement on previous market
-    evaluate_previous_trade()
+    # 1. Housekeeping: Cancel unfilled resting orders & evaluate previous settlement
+    cancel_resting_orders()
+    check_previous_settlement()
 
-    # 3. Fetch active 15m contract
-    path = "/markets?series_ticker=KXBTC15M&status=open"
-    m_res = kalshi_request("GET", path)
-    if m_res.status_code != 200:
-        raise HTTPException(status_code=500, detail="Failed to fetch active Kalshi markets")
+    # 2. Identify the active 15m contract
+    ticker = get_current_btc_market()
+    contracts = state["multiplier"]
 
-    markets = m_res.json().get("markets", [])
-    if not markets:
-        return {"status": "skipped", "reason": "No open 15m market"}
-
-    target_market = markets[0]
-    ticker = target_market["ticker"]
-
-    # 4. Virtual Paper Tracking
-    if state["mode"] == "PAPER":
-        print(f"[PAPER TRADE] Virtual order tracking for {ticker} | Side: {side.upper()} @ 50¢ limit")
-        state["last_ticker"] = ticker
-        state["last_side"] = side
-        state["last_was_live"] = False
-        return {"status": "paper_recorded", "ticker": ticker, "mode": "PAPER"}
-
-    # 5. Live Limit Order Execution at 1:1 (50¢ limit price)
-    contracts = 1 * state["multiplier"]
+    # 3. Submit limit buy at 50 cents (1:1 payout)
+    price_field = "yes_price" if side == "yes" else "no_price"
     order_body = {
         "action": "buy",
         "count": contracts,
         "side": side,
         "ticker": ticker,
         "type": "limit",
-        "yes_price": 50 if side == "yes" else 50
+        price_field: 50
     }
 
-    o_res = kalshi_request("POST", "/portfolio/orders", order_body)
+    if state["mode"] == "LIVE":
+        order_resp = kalshi_request("POST", "/portfolio/orders", order_body)
+        print(f"[LIVE ORDER] Ticker: {ticker} | Side: {side.upper()} | Qty: {contracts} | Status: {order_resp.status_code}")
+        print(f"[LIVE RESPONSE] {order_resp.text}")
+        state["last_was_live"] = True
+    else:
+        print(f"[PAPER ORDER] Ticker: {ticker} | Side: {side.upper()} | Qty: {contracts} @ 50¢")
+        state["last_was_live"] = False
+
+    # Store position context for next settlement check
     state["last_ticker"] = ticker
     state["last_side"] = side
-    state["last_was_live"] = True
 
-    print(f"[LIVE ORDER] Placed resting 1:1 limit order ({contracts}x {side.upper()} @ 50¢) on {ticker} | Status: {o_res.status_code}")
-    return o_res.json()
+    return {
+        "status": "success",
+        "mode": state["mode"],
+        "ticker": ticker,
+        "side": side,
+        "contracts": contracts,
+        "price": 50
+    }
