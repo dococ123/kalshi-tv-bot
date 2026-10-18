@@ -9,24 +9,17 @@ import requests
 
 app = FastAPI()
 
-# ---------------------------------------------------------
-# CREDENTIALS & CONSTANTS
-# ---------------------------------------------------------
 KALSHI_API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 KEY_ID = os.environ.get("KALSHI_API_KEY_ID") or os.environ.get("KALSHI_KEY_ID")
 PRIVATE_KEY_STR = os.environ.get("KALSHI_PRIVATE_KEY")
 PASSPHRASE = os.environ.get("WEBHOOK_PASSPHRASE", "my_secret_key_123")
-MAX_MULTIPLIER = 8  # Risk Cap: Prevents Martingale from exceeding 8 contracts ($8)
+MAX_MULTIPLIER = 8
 
-# ---------------------------------------------------------
-# BOT INTERNAL STATE
-# ---------------------------------------------------------
 state = {
-    "mode": "LIVE",        # "LIVE" or "PAPER"
-    "multiplier": 1,       # 1, 2, 4, max 8
+    "mode": "LIVE",
+    "multiplier": 1,
     "last_ticker": None,
-    "last_side": None,
-    "last_was_live": True
+    "last_side": None
 }
 
 
@@ -63,93 +56,46 @@ def kalshi_request(method: str, path: str, payload: dict = None):
 
     url = KALSHI_API_BASE + path
     if method.upper() == "GET":
-        resp = requests.get(url, headers=headers, params=payload)
+        return requests.get(url, headers=headers, params=payload)
     elif method.upper() == "POST":
-        resp = requests.post(url, headers=headers, json=payload)
+        return requests.post(url, headers=headers, json=payload)
     elif method.upper() == "DELETE":
-        resp = requests.delete(url, headers=headers)
-    else:
-        raise ValueError(f"Unsupported method: {method}")
-
-    return resp
-
-
-def cancel_resting_orders():
-    try:
-        resp = kalshi_request("DELETE", "/portfolio/events/orders")
-        if resp.status_code in [200, 204]:
-            print("[CLEANUP] Successfully canceled resting orders.")
-    except Exception as e:
-        print(f"[CLEANUP ERROR] {e}")
-
-
-def check_previous_settlement():
-    global state
-    if not state["last_ticker"]:
-        return
-
-    try:
-        resp = kalshi_request("GET", f"/markets/{state['last_ticker']}")
-        if resp.status_code == 200:
-            m = resp.json().get("market", {})
-            result = m.get("result")  # "yes" or "no"
-
-            if result:
-                if result == state["last_side"]:
-                    print(f"[SETTLEMENT] WIN on {state['last_ticker']}! Resetting multiplier to 1.")
-                    state["multiplier"] = 1
-                else:
-                    new_mult = min(state["multiplier"] * 2, MAX_MULTIPLIER)
-                    print(f"[SETTLEMENT] LOSS on {state['last_ticker']}. Multiplier increased to {new_mult}.")
-                    state["multiplier"] = new_mult
-                state["last_ticker"] = None
-                state["last_side"] = None
-    except Exception as e:
-        print(f"[SETTLEMENT CHECK ERROR] {e}")
+        return requests.delete(url, headers=headers)
+    raise ValueError(f"Unsupported method: {method}")
 
 
 def get_current_btc_market():
-    # 1. Fetch open 15m Bitcoin events with nested active markets
+    # Fetch open 15-minute events and take the active contract ticker
     resp = kalshi_request("GET", "/events", {
         "series_ticker": "KXBTC15M",
         "status": "open",
         "with_nested_markets": True
     })
-    
     if resp.status_code == 200:
         events = resp.json().get("events", [])
         if events:
-            # Sort events by close time to ensure we trade the currently closing 15m window
-            events_sorted = sorted(
-                events, 
-                key=lambda e: min([m.get("close_time", "") for m in e.get("markets", [])] or [e.get("mutually_exclusive", "")])
-            )
-            for ev in events_sorted:
-                markets = ev.get("markets", [])
-                for m in markets:
-                    if m.get("status") in ["active", "open"] or not m.get("status"):
-                        return m.get("ticker")
+            events_sorted = sorted(events, key=lambda e: min([m.get("close_time", "") for m in e.get("markets", [])] or ["9999"]))
+            markets = events_sorted[0].get("markets", [])
+            for m in markets:
+                if m.get("status") in ["active", "open"] or not m.get("status"):
+                    return m.get("ticker")
 
-    # 2. Fallback to direct /markets query
+    # Direct markets fallback
     resp = kalshi_request("GET", "/markets", {
         "series_ticker": "KXBTC15M",
         "status": "open",
         "limit": 10
     })
-    if resp.status_code != 200:
-        raise Exception(f"Failed to fetch KXBTC15M markets: {resp.text}")
-
     markets = resp.json().get("markets", [])
     if not markets:
         raise Exception("No active open KXBTC15M market found")
-
     markets_sorted = sorted(markets, key=lambda x: x.get("close_time", ""))
     return markets_sorted[0].get("ticker")
 
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "kalshi-tradingview-bot", "state": state}
+    return {"status": "ok", "state": state}
 
 
 @app.post("/webhook")
@@ -167,16 +113,16 @@ async def webhook(request: Request):
     if side not in ["yes", "no"]:
         raise HTTPException(status_code=400, detail="Side must be 'yes' or 'no'")
 
-    # 1. Housekeeping: Cancel unfilled resting orders & evaluate previous settlement
-    cancel_resting_orders()
-    check_previous_settlement()
+    # Cancel older resting orders
+    try:
+        kalshi_request("DELETE", "/portfolio/events/orders")
+    except Exception:
+        pass
 
-    # 2. Identify the active 15m contract
     ticker = get_current_btc_market()
     contracts = state["multiplier"]
-
-    # 3. Kalshi V2 Order Shape: bid = Buy YES, ask = Buy NO / Sell YES
     v2_side = "bid" if side == "yes" else "ask"
+
     order_body = {
         "ticker": ticker,
         "client_order_id": str(uuid.uuid4()),
@@ -194,22 +140,10 @@ async def webhook(request: Request):
 
     if state["mode"] == "LIVE":
         order_resp = kalshi_request("POST", "/portfolio/events/orders", order_body)
-        print(f"[LIVE ORDER V2] Ticker: {ticker} | Side: {side.upper()} ({v2_side}) | Qty: {contracts} | Status: {order_resp.status_code}")
+        print(f"[LIVE ORDER V2] {ticker} | {side.upper()} ({v2_side}) | Status: {order_resp.status_code}")
         print(f"[LIVE RESPONSE] {order_resp.text}")
-        state["last_was_live"] = True
-    else:
-        print(f"[PAPER ORDER] Ticker: {ticker} | Side: {side.upper()} | Qty: {contracts} @ 50¢")
-        state["last_was_live"] = False
 
-    # Store position context for next settlement check
     state["last_ticker"] = ticker
     state["last_side"] = side
 
-    return {
-        "status": "success",
-        "mode": state["mode"],
-        "ticker": ticker,
-        "side": side,
-        "contracts": contracts,
-        "price": 0.50
-    }
+    return {"status": "success", "ticker": ticker, "side": side, "contracts": contracts}
