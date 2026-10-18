@@ -1,162 +1,143 @@
+import base64
 import os
 import time
-from fastapi import FastAPI, HTTPException, Request
-import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
-import base64
+from fastapi import FastAPI, HTTPException, Request
+import requests
 
 app = FastAPI()
 
 # ---------------------------------------------------------
-# CONFIGURATION & CREDENTIALS
+# CREDENTIALS & CONSTANTS
 # ---------------------------------------------------------
-WEBHOOK_PASSPHRASE = os.environ.get("WEBHOOK_PASSPHRASE", "my_secret_key_123")
-KALSHI_API_KEY_ID = os.environ.get("KALSHI_API_KEY_ID")
-KALSHI_PRIVATE_KEY_PEM = os.environ.get("KALSHI_PRIVATE_KEY")
-KALSHI_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
+KALSHI_API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
+KEY_ID = os.environ.get("KALSHI_API_KEY_ID") or os.environ.get("KALSHI_KEY_ID")
+PRIVATE_KEY_STR = os.environ.get("KALSHI_PRIVATE_KEY")
+PASSPHRASE = os.environ.get("WEBHOOK_PASSPHRASE", "my_secret_key_123")
 
 # ---------------------------------------------------------
-# BOT INTERNAL STATE (In-Memory Streak & Bankroll Tracking)
+# STATE MACHINE (Streak Rider & Martingale on Paper Win)
 # ---------------------------------------------------------
 state = {
-    "mode": "LIVE",              # "LIVE" or "PAPER"
-    "multiplier": 1,             # Martingale level: 1, 2, 4, 8...
-    "last_ticker": None,         # Last traded Kalshi ticker
-    "last_side": None,           # "yes" or "no"
-    "last_was_live": True        # Was the last trade actual money or virtual
+    "mode": "LIVE",        # "LIVE" or "PAPER"
+    "multiplier": 1,       # Martingale level: 1, 2, 4, 8...
+    "last_ticker": None,   # Last Kalshi market
+    "last_side": None,     # "yes" or "no"
+    "last_was_live": True  # True if placed with real money, False if paper
 }
 
-# ---------------------------------------------------------
-# KALSHI RSA AUTHENTICATION
-# ---------------------------------------------------------
-def get_kalshi_headers(method: str, path: str):
-    if not KALSHI_API_KEY_ID or not KALSHI_PRIVATE_KEY_PEM:
-        raise ValueError("Missing Kalshi API credentials in environment.")
-    
-    timestamp = str(int(time.time() * 1000))
-    msg = f"{timestamp}{method}{path}".encode("utf-8")
-    
-    private_key = serialization.load_pem_private_key(
-        KALSHI_PRIVATE_KEY_PEM.encode("utf-8"),
-        password=None
-    )
-    signature = private_key.sign(
-        msg,
-        padding.PSS(
-            mgf=padding.MGF1(hashes.SHA256()),
-            salt_length=padding.PSS.MAX_LENGTH
-        ),
-        hashes.SHA256()
-    )
-    sig_b64 = base64.b64encode(signature).decode("utf-8")
-    
-    return {
-        "KALSHI-ACCESS-KEY": KALSHI_API_KEY_ID,
-        "KALSHI-ACCESS-SIGNATURE": sig_b64,
-        "KALSHI-ACCESS-TIMESTAMP": timestamp,
-        "Content-Type": "application/json"
-    }
+def get_private_key():
+    if not PRIVATE_KEY_STR:
+        raise ValueError("Missing KALSHI_PRIVATE_KEY environment variable")
+    return serialization.load_pem_private_key(PRIVATE_KEY_STR.encode("utf-8"), password=None)
 
-# ---------------------------------------------------------
-# SETTLEMENT EVALUATOR
-# ---------------------------------------------------------
+def sign_pss(text: str) -> str:
+    key = get_private_key()
+    sig = key.sign(
+        text.encode("utf-8"),
+        padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
+        hashes.SHA256(),
+    )
+    return base64.b64encode(sig).decode("utf-8")
+
+def kalshi_request(method: str, path: str, body: dict = None):
+    ts = str(int(time.time() * 1000))
+    sig = sign_pss(ts + method.upper() + path)
+    headers = {
+        "KALSHI-ACCESS-KEY": KEY_ID,
+        "KALSHI-ACCESS-SIGNATURE": sig,
+        "KALSHI-ACCESS-TIMESTAMP": ts,
+        "Content-Type": "application/json",
+    }
+    url = f"{KALSHI_API_BASE}{path}"
+    if method.upper() == "GET":
+        return requests.get(url, headers=headers)
+    return requests.post(url, headers=headers, json=body)
+
 def evaluate_previous_trade():
-    """Checks whether the last tracked market resolved YES or NO."""
+    """Checks settlement of the previous market to evaluate win/loss."""
     if not state["last_ticker"]:
         return
 
     path = f"/markets/{state['last_ticker']}"
-    headers = get_kalshi_headers("GET", path)
-    res = requests.get(f"{KALSHI_BASE_URL}{path}", headers=headers)
-    
+    res = kalshi_request("GET", path)
     if res.status_code == 200:
-        data = res.json().get("market", {})
-        result = data.get("result") # "yes", "no", or None if still active
-        
+        market = res.json().get("market", {})
+        result = market.get("result") # "yes", "no", or None if open
         if result:
             won = (result == state["last_side"])
-            print(f"[SETTLEMENT] {state['last_ticker']} result: {result} | Bot side: {state['last_side']} | Won: {won}")
+            print(f"[SETTLEMENT] Market: {state['last_ticker']} | Result: {result} | Bot Side: {state['last_side']} | Won: {won}")
             
             if state["last_was_live"]:
                 if won:
-                    print("[RESULT] Live WIN. Continuing live streak at base size.")
+                    print("[RESULT] Live WIN. Keeping live streak active at base size.")
                     state["mode"] = "LIVE"
                     state["multiplier"] = 1
                 else:
-                    print("[RESULT] Live LOSS. Switching to PAPER tracking mode to absorb losing streaks.")
+                    print("[RESULT] Live LOSS. Switching to PAPER mode to avoid streak losses.")
                     state["mode"] = "PAPER"
-            else: # Last trade was paper
+            else:
                 if won:
-                    print("[RESULT] Paper WIN recorded. Regime restored -> Resuming LIVE on next setup (Doubled).")
+                    print("[RESULT] Paper WIN achieved. Resuming LIVE mode with doubled size.")
                     state["mode"] = "LIVE"
                     state["multiplier"] *= 2
                 else:
-                    print("[RESULT] Paper LOSS. Staying in PAPER mode until a paper win appears.")
+                    print("[RESULT] Paper LOSS. Remaining in PAPER mode until next paper win.")
                     state["mode"] = "PAPER"
 
-# ---------------------------------------------------------
-# WEBHOOK ENDPOINT
-# ---------------------------------------------------------
 @app.post("/webhook")
-async def receive_signal(request: Request):
+async def webhook(request: Request):
     payload = await request.json()
     
-    # 1. Security check
-    if payload.get("passphrase") != WEBHOOK_PASSPHRASE:
-        raise HTTPException(status_code=401, detail="Invalid passphrase")
+    # 1. Verify passphrase
+    if payload.get("passphrase") != PASSPHRASE:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
-    side = payload.get("side", "yes").lower() # "yes" or "no"
-    series_ticker = "KXBTC15M"
+    side = payload.get("side", "yes").lower()
 
-    # 2. Check previous market result before acting on new setup
+    # 2. Check previous settlement to maintain streak state
     evaluate_previous_trade()
 
-    # 3. Fetch currently open 15m BTC contract
-    headers = get_kalshi_headers("GET", f"/markets?series_ticker={series_ticker}&status=open")
-    m_res = requests.get(f"{KALSHI_BASE_URL}/markets?series_ticker={series_ticker}&status=open", headers=headers)
-    
+    # 3. Locate active 15m BTC contract
+    path = "/markets?series_ticker=KXBTC15M&status=open"
+    m_res = kalshi_request("GET", path)
     if m_res.status_code != 200:
-        raise HTTPException(status_code=500, detail="Failed to fetch active Kalshi markets")
-    
+        raise HTTPException(status_code=500, detail="Failed to fetch Kalshi markets")
+
     markets = m_res.json().get("markets", [])
     if not markets:
-        return {"status": "skipped", "reason": "No open 15m market available right now"}
-    
+        return {"status": "skipped", "reason": "No open 15m markets available"}
+
     target_market = markets[0]
     ticker = target_market["ticker"]
-    
-    # 4. Check 1:1 Risk/Reward Rule (Must be <= 50 cents)
-    current_price = target_market.get(f"{side}_ask", 100)
-    if current_price > 50:
-        print(f"[REJECTED 1:1] {ticker} {side.upper()} ask price is {current_price}¢ (> 50¢). Skipping trade.")
-        return {"status": "skipped", "reason": f"Entry price {current_price}¢ exceeds 1:1 max of 50¢"}
 
-    # 5. Route between LIVE and PAPER
+    # 4. Handle Paper Mode (Virtual Tracking)
     if state["mode"] == "PAPER":
-        print(f"[PAPER TRADE] Virtual order recorded for {ticker} | Side: {side.upper()} @ {current_price}¢")
+        print(f"[PAPER TRADE] Virtual order recorded for {ticker} | Side: {side.upper()} (Targeting 1:1 <= 50¢)")
         state["last_ticker"] = ticker
         state["last_side"] = side
         state["last_was_live"] = False
         return {"status": "paper_recorded", "ticker": ticker, "mode": "PAPER"}
 
-    # 6. Execute LIVE Order (Base count * Martingale multiplier)
+    # 5. Execute LIVE Order with a 50¢ Rest Limit Order
+    # Setting limit price to 50¢ ensures fill ONLY occurs if price is 1:1 or better (<= 50¢).
+    # If market is > 50¢, the order rests on Kalshi's book waiting for the dip.
     contracts = 1 * state["multiplier"]
-    order_payload = {
+    
+    order_body = {
         "action": "buy",
         "count": contracts,
         "side": side,
         "ticker": ticker,
         "type": "limit",
-        "yes_price": current_price if side == "yes" else (100 - current_price)
+        "yes_price": 50 if side == "yes" else 50
     }
 
-    order_headers = get_kalshi_headers("POST", "/portfolio/orders")
-    o_res = requests.post(f"{KALSHI_BASE_URL}/portfolio/orders", json=order_payload, headers=order_headers)
-    
+    o_res = kalshi_request("POST", "/portfolio/orders", order_body)
     state["last_ticker"] = ticker
     state["last_side"] = side
     state["last_was_live"] = True
 
-    print(f"[LIVE ORDER] Placed {contracts}x {side.upper()} on {ticker} @ {current_price}¢ | Status: {o_res.status_code}")
+    print(f"[LIVE ORDER] Placed resting 1:1 limit order ({contracts}x {side.upper()} @ 50¢) on {ticker} | Status: {o_res.status_code}")
     return o_res.json()
