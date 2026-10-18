@@ -1,6 +1,7 @@
 import base64
 import os
 import time
+import uuid
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from fastapi import FastAPI, HTTPException, Request
@@ -75,13 +76,9 @@ def kalshi_request(method: str, path: str, payload: dict = None):
 
 def cancel_resting_orders():
     try:
-        resp = kalshi_request("GET", "/portfolio/orders", {"status": "resting"})
-        if resp.status_code == 200:
-            orders = resp.json().get("orders", [])
-            for o in orders:
-                oid = o.get("order_id")
-                kalshi_request("DELETE", f"/portfolio/orders/{oid}")
-                print(f"[CLEANUP] Canceled resting order: {oid}")
+        resp = kalshi_request("DELETE", "/portfolio/events/orders")
+        if resp.status_code in [200, 204]:
+            print("[CLEANUP] Successfully canceled resting orders.")
     except Exception as e:
         print(f"[CLEANUP ERROR] {e}")
 
@@ -156,20 +153,26 @@ async def webhook(request: Request):
     ticker = get_current_btc_market()
     contracts = state["multiplier"]
 
-    # 3. Submit limit buy at 50 cents (1:1 payout)
-    price_field = "yes_price" if side == "yes" else "no_price"
+    # 3. Kalshi V2 Order Shape: bid = Buy YES, ask = Buy NO / Sell YES
+    v2_side = "bid" if side == "yes" else "ask"
     order_body = {
-        "action": "buy",
-        "count": contracts,
-        "side": side,
         "ticker": ticker,
-        "type": "limit",
-        price_field: 50
+        "client_order_id": str(uuid.uuid4()),
+        "side": v2_side,
+        "count": f"{float(contracts):.2f}",
+        "price": "0.5000",
+        "time_in_force": "good_till_canceled",
+        "self_trade_prevention_type": "taker_at_cross",
+        "post_only": False,
+        "cancel_order_on_pause": False,
+        "reduce_only": False,
+        "subaccount": 0,
+        "exchange_index": 0
     }
 
     if state["mode"] == "LIVE":
-        order_resp = kalshi_request("POST", "/portfolio/orders", order_body)
-        print(f"[LIVE ORDER] Ticker: {ticker} | Side: {side.upper()} | Qty: {contracts} | Status: {order_resp.status_code}")
+        order_resp = kalshi_request("POST", "/portfolio/events/orders", order_body)
+        print(f"[LIVE ORDER V2] Ticker: {ticker} | Side: {side.upper()} ({v2_side}) | Qty: {contracts} | Status: {order_resp.status_code}")
         print(f"[LIVE RESPONSE] {order_resp.text}")
         state["last_was_live"] = True
     else:
@@ -186,5 +189,5 @@ async def webhook(request: Request):
         "ticker": ticker,
         "side": side,
         "contracts": contracts,
-        "price": 50
+        "price": 0.50
     }
