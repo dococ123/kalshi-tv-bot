@@ -2,16 +2,21 @@ import base64
 import os
 import time
 import uuid
+from urllib.parse import urlparse
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi import FastAPI, HTTPException, Request
 import requests
 
 app = FastAPI()
 
-KALSHI_API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
-KEY_ID = os.environ.get("KALSHI_API_KEY_ID") or os.environ.get("KALSHI_KEY_ID")
-PRIVATE_KEY_STR = os.environ.get("KALSHI_PRIVATE_KEY")
+# ---------------------------------------------------------
+# CREDENTIALS & CONSTANTS
+# ---------------------------------------------------------
+KALSHI_API_BASE = "https://external-api.kalshi.com/trade-api/v2"
+KEY_ID = (os.environ.get("KALSHI_API_KEY_ID") or os.environ.get("KALSHI_KEY_ID") or "").strip()
+PRIVATE_KEY_STR = os.environ.get("KALSHI_PRIVATE_KEY", "").strip()
 PASSPHRASE = os.environ.get("WEBHOOK_PASSPHRASE", "my_secret_key_123")
 MAX_MULTIPLIER = 8
 
@@ -29,23 +34,30 @@ def get_private_key():
     return serialization.load_pem_private_key(PRIVATE_KEY_STR.encode("utf-8"), password=None)
 
 
-def sign_pss(text: str) -> str:
-    private_key = get_private_key()
-    signature = private_key.sign(
-        text.encode("utf-8"),
-        padding.PSS(
-            mgf=padding.MGF1(hashes.SHA256()),
-            salt_length=padding.PSS.DIGEST_LENGTH
-        ),
-        hashes.SHA256()
-    )
-    return base64.b64encode(signature).decode("utf-8")
+def sign_request(priv_key, timestamp: str, method: str, full_path: str) -> str:
+    # Sign timestamp + HTTP_METHOD + full URL path without query params
+    path_without_query = full_path.split("?")[0]
+    message = f"{timestamp}{method.upper()}{path_without_query}".encode("utf-8")
+
+    if isinstance(priv_key, Ed25519PrivateKey):
+        sig = priv_key.sign(message)
+    else:
+        sig = priv_key.sign(
+            message,
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.DIGEST_LENGTH
+            ),
+            hashes.SHA256()
+        )
+    return base64.b64encode(sig).decode("utf-8")
 
 
 def kalshi_request(method: str, path: str, payload: dict = None):
+    priv_key = get_private_key()
     timestamp_ms = str(int(time.time() * 1000))
-    msg_to_sign = timestamp_ms + method.upper() + "/trade-api/v2" + path
-    sig = sign_pss(msg_to_sign)
+    sign_path = urlparse(KALSHI_API_BASE + path).path
+    sig = sign_request(priv_key, timestamp_ms, method, sign_path)
 
     headers = {
         "Content-Type": "application/json",
@@ -65,7 +77,6 @@ def kalshi_request(method: str, path: str, payload: dict = None):
 
 
 def get_current_btc_market():
-    # Fetch open 15-minute events and take the active contract ticker
     resp = kalshi_request("GET", "/events", {
         "series_ticker": "KXBTC15M",
         "status": "open",
@@ -80,7 +91,6 @@ def get_current_btc_market():
                 if m.get("status") in ["active", "open"] or not m.get("status"):
                     return m.get("ticker")
 
-    # Direct markets fallback
     resp = kalshi_request("GET", "/markets", {
         "series_ticker": "KXBTC15M",
         "status": "open",
@@ -95,7 +105,14 @@ def get_current_btc_market():
 
 @app.get("/")
 def root():
-    return {"status": "ok", "state": state}
+    # Diagnostic health check: tests credentials on startup/load
+    test_result = "not tested"
+    try:
+        b_resp = kalshi_request("GET", "/portfolio/balance")
+        test_result = f"Authenticated! Balance HTTP {b_resp.status_code}"
+    except Exception as e:
+        test_result = f"Auth check error: {e}"
+    return {"status": "ok", "state": state, "auth_test": test_result}
 
 
 @app.post("/webhook")
@@ -113,7 +130,6 @@ async def webhook(request: Request):
     if side not in ["yes", "no"]:
         raise HTTPException(status_code=400, detail="Side must be 'yes' or 'no'")
 
-    # Cancel older resting orders
     try:
         kalshi_request("DELETE", "/portfolio/events/orders")
     except Exception:
